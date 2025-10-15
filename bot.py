@@ -14,11 +14,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Admin and Maintenance ---
+ADMIN_IDS = set(int(admin_id) for admin_id in os.getenv("ADMIN_IDS", "").split(',') if admin_id)
+maintenance_mode = False
+maintenance_message = "🔧 Bot is under maintenance. Please try again later."
+
 # --- Data Structures ---
+waiting_premium_users = deque()
 waiting_users = deque()
 active_chats = {}
 user_reputations = {}
 user_behavior_tracker = {}
+premium_users = {123456789} # Example premium user ID. In a real app, this would come from a database.
 
 # --- Constants ---
 DEFAULT_REPUTATION = 80
@@ -30,17 +37,16 @@ REPUTATION_LEVEL_SUSPENDED = 40
 # Behavior constants
 SUSPICIOUS_SKIP_TIME_SECONDS = 5
 REPUTATION_PENALTY_SUSPICIOUS_MESSAGE = -2
-REPUTATION_PENALTY_SUSPICIOUS_BEHAVIOR = -3
 REPUTATION_PENALTY_CONFIRMED_SPAM = -5
 
 # A simple set of forbidden words for content filtering
-FORBIDDEN_WORDS = {"spam", "promo", "sale", "vulgarword"} # Example words
+FORBIDDEN_WORDS = {"spam", "promo", "sale", "vulgarword"}
 
 # --- Helper Functions ---
 
 def get_user_reputation(user_id: int) -> int:
     if user_id not in user_reputations:
-        user_reputations[user_id] = DEFAULT_REPUTATION
+        user_reputations[user_id] = PREMIUM_REPUTATION if user_id in premium_users else DEFAULT_REPUTATION
     return user_reputations.get(user_id, DEFAULT_REPUTATION)
 
 def update_reputation(user_id: int, change: int):
@@ -61,6 +67,11 @@ def is_message_suspicious(text: str) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+
+    if maintenance_mode and user_id not in ADMIN_IDS:
+        await update.message.reply_text(maintenance_message)
+        return
+
     reputation = get_user_reputation(user_id)
 
     if reputation < REPUTATION_LEVEL_SUSPENDED:
@@ -71,19 +82,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("You are already in a chat. Use /stop to end it.")
         return
 
-    if user_id in waiting_users:
+    if user_id in waiting_users or user_id in waiting_premium_users:
         await update.message.reply_text("You are already looking for a partner. Please wait.")
         return
 
     user_behavior_tracker[user_id] = {'last_message_time': None, 'message_sent': False}
-    waiting_users.append(user_id)
-    await update.message.reply_text("🔎 Searching for a partner... Please wait.")
+
+    if user_id in premium_users:
+        waiting_premium_users.append(user_id)
+        await update.message.reply_text("👑 Searching for a partner with high priority... Please wait.")
+    else:
+        waiting_users.append(user_id)
+        await update.message.reply_text("🔎 Searching for a partner... Please wait.")
+
     logger.info(f"User {user_id} (Rep: {reputation}) started searching.")
     await try_match_users(context)
 
 async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_TYPE, is_next: bool = False):
     if user_id not in active_chats:
-        if not is_next: # Avoid duplicate messages on /next
+        if not is_next:
             await context.bot.send_message(chat_id=user_id, text="You are not in a chat. Use /start to find one.")
         return False
 
@@ -94,21 +111,11 @@ async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_
         time_since_message = time.time() - (tracker.get('last_message_time') or 0)
         if time_since_message < SUSPICIOUS_SKIP_TIME_SECONDS:
             logger.warning(f"User {user_id} flagged for suspicious behavior. Triggering human validation for partner {partner_id}.")
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Yes", callback_data=f"validate_yes_{user_id}"),
-                    InlineKeyboardButton("❌ No", callback_data=f"validate_no_{user_id}"),
-                ]
-            ]
+            keyboard = [[InlineKeyboardButton("✅ Yes", callback_data=f"validate_yes_{user_id}"), InlineKeyboardButton("❌ No", callback_data=f"validate_no_{user_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await context.bot.send_message(
-                chat_id=partner_id,
-                text="⚠️ Your partner left right after sending a message. Was it a vulgar or promotional message?",
-                reply_markup=reply_markup
-            )
+            await context.bot.send_message(chat_id=partner_id, text="⚠️ Your partner left right after sending a message. Was it a vulgar or promotional message?", reply_markup=reply_markup)
         else:
-            # Normal chat ending > 1 min can increase reputation
-            update_reputation(user_id, 1) # Small reward
+            update_reputation(user_id, 1)
             update_reputation(partner_id, 1)
 
     if not is_next:
@@ -135,16 +142,16 @@ async def next_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     reputation = get_user_reputation(user_id)
-    await update.message.reply_text(f"Your unique ID is: `{user_id}`\nYour reputation score is: {reputation}", parse_mode='MarkdownV2')
+    status = "Premium" if user_id in premium_users else "Non-Premium"
+    await update.message.reply_text(f"Your unique ID is: `{user_id}`\nYour reputation score is: {reputation}\nStatus: {status}", parse_mode='MarkdownV2')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    reputation = get_user_reputation(user_id)
-
     if user_id not in active_chats:
         await update.message.reply_text("You are not in a chat. Use /start to find one.")
         return
 
+    reputation = get_user_reputation(user_id)
     if reputation <= REPUTATION_LEVEL_RISKY and update.message.sticker:
         await update.message.reply_text("Your reputation is too low to send stickers.")
         return
@@ -173,10 +180,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif message.document: await context.bot.send_document(chat_id=partner_id, document=message.document.file_id)
     else: await update.message.reply_text("Unsupported message type.")
 
-# --- Callback Query Handler ---
-
 async def handle_validation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the user's response to the validation query."""
     query = update.callback_query
     await query.answer()
 
@@ -187,22 +191,72 @@ async def handle_validation_callback(update: Update, context: ContextTypes.DEFAU
     if action == "yes":
         update_reputation(reported_user_id, REPUTATION_PENALTY_CONFIRMED_SPAM)
         await query.edit_message_text(text="Thank you for your feedback. The user has been penalized.")
-    else: # "no"
+    else:
         await query.edit_message_text(text="Thank you for your feedback. No action will be taken.")
 
-# --- Main Bot Logic ---
-
 async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(waiting_users) >= 2:
+    """Matches users with a priority for premium users."""
+    while len(waiting_premium_users) >= 2:
+        user1_id = waiting_premium_users.popleft()
+        user2_id = waiting_premium_users.popleft()
+        await _create_chat(user1_id, user2_id, context)
+
+    while len(waiting_premium_users) >= 1 and len(waiting_users) >= 1:
+        user1_id = waiting_premium_users.popleft()
+        user2_id = waiting_users.popleft()
+        await _create_chat(user1_id, user2_id, context)
+
+    while len(waiting_users) >= 2:
         user1_id = waiting_users.popleft()
         user2_id = waiting_users.popleft()
+        await _create_chat(user1_id, user2_id, context)
 
-        active_chats[user1_id] = user2_id
-        active_chats[user2_id] = user1_id
+async def _create_chat(user1_id: int, user2_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Helper function to create a chat between two users."""
+    active_chats[user1_id] = user2_id
+    active_chats[user2_id] = user1_id
+    logger.info(f"Matched {user1_id} and {user2_id}.")
+    await context.bot.send_message(chat_id=user1_id, text="✅ Partner found! You can start chatting.")
+    await context.bot.send_message(chat_id=user2_id, text="✅ Partner found! You can start chatting.")
 
-        logger.info(f"Matched {user1_id} and {user2_id}.")
-        await context.bot.send_message(chat_id=user1_id, text="✅ Partner found! You can start chatting.")
-        await context.bot.send_message(chat_id=user2_id, text="✅ Partner found! You can start chatting.")
+# --- Admin Commands ---
+
+async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global maintenance_mode, maintenance_message
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    maintenance_mode = True
+    custom_message = ' '.join(context.args)
+    if custom_message:
+        maintenance_message = custom_message
+
+    logger.info(f"Maintenance mode enabled by {user_id}. Message: {maintenance_message}")
+    await update.message.reply_text(f"✅ Maintenance mode has been enabled.\nMessage: {maintenance_message}")
+
+async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global maintenance_mode
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    maintenance_mode = False
+    logger.info(f"Maintenance mode disabled by {user_id}.")
+    await update.message.reply_text("✅ Bot has been resumed.")
+
+async def shutdown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    await update.message.reply_text("🛑 Shutting down the bot...")
+    logger.info(f"Shutdown command received from {user_id}. Exiting.")
+    # This will stop the application gracefully
+    asyncio.create_task(context.application.shutdown())
 
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -212,23 +266,25 @@ def main() -> None:
 
     application = Application.builder().token(token).build()
 
+    # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("next", next_chat))
     application.add_handler(CommandHandler("myid", myid))
 
-    application.add_handler(CallbackQueryHandler(handle_validation_callback, pattern=r'^validate_'))
+    # Admin Commands
+    application.add_handler(CommandHandler("maintenance", maintenance_cmd))
+    application.add_handler(CommandHandler("resume", resume_cmd))
+    application.add_handler(CommandHandler("shutdown", shutdown_cmd))
 
-    message_handlers = [
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
-        MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_message),
-        MessageHandler(filters.STICKER & ~filters.COMMAND, handle_message),
-        MessageHandler(filters.VOICE & ~filters.COMMAND, handle_message),
-        MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_message),
-        MessageHandler(filters.DOCUMENT & ~filters.COMMAND, handle_message)
-    ]
-    for handler in message_handlers:
-        application.add_handler(handler)
+    # Handlers
+    application.add_handler(CallbackQueryHandler(handle_validation_callback, pattern=r'^validate_'))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.STICKER & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.DOCUMENT & ~filters.COMMAND, handle_message))
 
     application.run_polling()
 

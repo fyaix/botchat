@@ -29,7 +29,8 @@ def initialize_database():
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS banned_stickers (
-                sticker_unique_id TEXT PRIMARY KEY
+                sticker_unique_id TEXT PRIMARY KEY,
+                sticker_file_id TEXT NOT NULL
             )
         """)
         con.commit()
@@ -69,19 +70,19 @@ def create_user_profile(user_id: int, is_premium: bool = False) -> dict:
         'is_trusted': False,
         'is_shadow_banned': False,
         'violation_count': 0,
-        'preferences': json.dumps({'gender': None, 'region': None, 'age': None})
+        'preferences': json.dumps({'gender': None, 'region': None, 'age': None}),
+        'age': None
     }
     try:
         con = sqlite3.connect(DATABASE_FILE)
         cur = con.cursor()
         cur.execute("""
-            INSERT INTO users (user_id, reputation, is_premium, is_trusted, is_shadow_banned, violation_count, preferences)
-            VALUES (:user_id, :reputation, :is_premium, :is_trusted, :is_shadow_banned, :violation_count, :preferences)
+            INSERT INTO users (user_id, reputation, is_premium, is_trusted, is_shadow_banned, violation_count, preferences, age)
+            VALUES (:user_id, :reputation, :is_premium, :is_trusted, :is_shadow_banned, :violation_count, :preferences, :age)
         """, profile)
         con.commit()
         con.close()
         logger.info(f"Created new profile for user {user_id} in database.")
-        # Convert preferences back to dict for return
         profile['preferences'] = json.loads(profile['preferences'])
         return profile
     except sqlite3.Error as e:
@@ -98,14 +99,11 @@ def get_or_create_user_profile(user_id: int, admin_ids: set) -> dict:
 
 def update_user_profile(user_id: int, updates: dict):
     """Updates specific fields of a user's profile."""
-    # Special handling for preferences dict
     if 'preferences' in updates:
         updates['preferences'] = json.dumps(updates['preferences'])
-
     fields = ", ".join([f"{key} = ?" for key in updates.keys()])
     values = list(updates.values())
     values.append(user_id)
-
     try:
         con = sqlite3.connect(DATABASE_FILE)
         cur = con.cursor()
@@ -130,17 +128,29 @@ def get_all_user_ids() -> list[int]:
         logger.error(f"Database error getting all user IDs: {e}")
         return []
 
-def add_banned_sticker(sticker_unique_id: str):
-    """Adds a sticker's unique ID to the banned list."""
+def add_banned_sticker(sticker_unique_id: str, sticker_file_id: str):
+    """Adds a sticker's unique and file IDs to the banned list."""
     try:
         con = sqlite3.connect(DATABASE_FILE)
         cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO banned_stickers (sticker_unique_id) VALUES (?)", (sticker_unique_id,))
+        cur.execute("INSERT OR REPLACE INTO banned_stickers (sticker_unique_id, sticker_file_id) VALUES (?, ?)", (sticker_unique_id, sticker_file_id))
         con.commit()
         con.close()
         logger.info(f"Sticker {sticker_unique_id} added to ban list.")
     except sqlite3.Error as e:
         logger.error(f"Database error banning sticker {sticker_unique_id}: {e}")
+
+def remove_banned_sticker(sticker_unique_id: str):
+    """Removes a sticker from the banned list."""
+    try:
+        con = sqlite3.connect(DATABASE_FILE)
+        cur = con.cursor()
+        cur.execute("DELETE FROM banned_stickers WHERE sticker_unique_id = ?", (sticker_unique_id,))
+        con.commit()
+        con.close()
+        logger.info(f"Sticker {sticker_unique_id} removed from ban list.")
+    except sqlite3.Error as e:
+        logger.error(f"Database error unbanning sticker {sticker_unique_id}: {e}")
 
 def is_sticker_banned(sticker_unique_id: str) -> bool:
     """Checks if a sticker is in the banned list."""
@@ -155,15 +165,16 @@ def is_sticker_banned(sticker_unique_id: str) -> bool:
         logger.error(f"Database error checking sticker {sticker_unique_id}: {e}")
         return False
 
-def get_all_banned_stickers() -> list[str]:
-    """Retrieves all banned sticker IDs from the database."""
+def get_all_banned_stickers() -> list[dict]:
+    """Retrieves all banned stickers (both IDs) from the database."""
     try:
         con = sqlite3.connect(DATABASE_FILE)
+        con.row_factory = dict_factory
         cur = con.cursor()
-        res = cur.execute("SELECT sticker_unique_id FROM banned_stickers")
-        sticker_ids = [row[0] for row in res.fetchall()]
+        res = cur.execute("SELECT sticker_unique_id, sticker_file_id FROM banned_stickers")
+        stickers = res.fetchall()
         con.close()
-        return sticker_ids
+        return stickers
     except sqlite3.Error as e:
         logger.error(f"Database error getting all banned stickers: {e}")
         return []

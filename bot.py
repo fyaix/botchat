@@ -396,26 +396,37 @@ async def bansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message.reply_to_message or not update.message.reply_to_message.sticker:
         await update.message.reply_text("Please reply to a sticker to ban it.")
         return
-    sticker_id = update.message.reply_to_message.sticker.file_unique_id
-    database.add_banned_sticker(sticker_id)
+    sticker = update.message.reply_to_message.sticker
+    database.add_banned_sticker(sticker.file_unique_id, sticker.file_id)
     await update.message.reply_text("Sticker has been banned successfully.")
 
 async def listbannedstickers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lists all banned sticker unique IDs."""
+    """Lists all banned stickers by sending them."""
     if update.effective_user.id not in ADMIN_IDS: return
 
-    banned_ids = database.get_all_banned_stickers()
-    if not banned_ids:
+    banned_stickers = database.get_all_banned_stickers()
+    if not banned_stickers:
         await update.message.reply_text("There are no banned stickers.")
         return
 
-    message = "📋 **Banned Sticker IDs**\n\n"
-    for sticker_id in banned_ids:
-        message += f"`{sticker_id}`\n"
+    await update.message.reply_text("📋 **Banned Stickers:**")
+    for sticker in banned_stickers:
+        try:
+            await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=sticker['sticker_file_id'])
+        except Exception as e:
+            await update.message.reply_text(f"Could not send sticker with unique_id: `{sticker['sticker_unique_id']}`\nError: {e}", parse_mode='MarkdownV2')
 
-    # Send the message in chunks if it's too long
-    for i in range(0, len(message), 4096):
-        await update.message.reply_text(message[i:i+4096], parse_mode='MarkdownV2')
+async def unbansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unbans a sticker by replying to it with this command."""
+    if update.effective_user.id not in ADMIN_IDS: return
+
+    if not update.message.reply_to_message or not update.message.reply_to_message.sticker:
+        await update.message.reply_text("Please reply to a sticker to unban it.")
+        return
+
+    sticker_id = update.message.reply_to_message.sticker.file_unique_id
+    database.remove_banned_sticker(sticker_id)
+    await update.message.reply_text("Sticker has been unbanned successfully.")
 
 def main() -> None:
     database.initialize_database()
@@ -439,6 +450,7 @@ def main() -> None:
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("trustuser", trustuser))
     application.add_handler(CommandHandler("bansticker", bansticker))
+    application.add_handler(CommandHandler("unbansticker", unbansticker))
     application.add_handler(CommandHandler("listbannedstickers", listbannedstickers))
 
     # Other Handlers

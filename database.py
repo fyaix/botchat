@@ -23,7 +23,13 @@ def initialize_database():
                 is_trusted BOOLEAN NOT NULL DEFAULT 0,
                 is_shadow_banned BOOLEAN NOT NULL DEFAULT 0,
                 violation_count INTEGER NOT NULL DEFAULT 0,
-                preferences TEXT
+                preferences TEXT,
+                age INTEGER
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS banned_stickers (
+                sticker_unique_id TEXT PRIMARY KEY
             )
         """)
         con.commit()
@@ -63,7 +69,7 @@ def create_user_profile(user_id: int, is_premium: bool = False) -> dict:
         'is_trusted': False,
         'is_shadow_banned': False,
         'violation_count': 0,
-        'preferences': json.dumps({'gender': None, 'region': None})
+        'preferences': json.dumps({'gender': None, 'region': None, 'age': None})
     }
     try:
         con = sqlite3.connect(DATABASE_FILE)
@@ -123,3 +129,28 @@ def get_all_user_ids() -> list[int]:
     except sqlite3.Error as e:
         logger.error(f"Database error getting all user IDs: {e}")
         return []
+
+def add_banned_sticker(sticker_unique_id: str):
+    """Adds a sticker's unique ID to the banned list."""
+    try:
+        con = sqlite3.connect(DATABASE_FILE)
+        cur = con.cursor()
+        cur.execute("INSERT OR IGNORE INTO banned_stickers (sticker_unique_id) VALUES (?)", (sticker_unique_id,))
+        con.commit()
+        con.close()
+        logger.info(f"Sticker {sticker_unique_id} added to ban list.")
+    except sqlite3.Error as e:
+        logger.error(f"Database error banning sticker {sticker_unique_id}: {e}")
+
+def is_sticker_banned(sticker_unique_id: str) -> bool:
+    """Checks if a sticker is in the banned list."""
+    try:
+        con = sqlite3.connect(DATABASE_FILE)
+        cur = con.cursor()
+        res = cur.execute("SELECT 1 FROM banned_stickers WHERE sticker_unique_id = ?", (sticker_unique_id,))
+        is_banned = res.fetchone() is not None
+        con.close()
+        return is_banned
+    except sqlite3.Error as e:
+        logger.error(f"Database error checking sticker {sticker_unique_id}: {e}")
+        return False

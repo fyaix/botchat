@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.helpers import escape_markdown
 
 import database
 
@@ -143,7 +144,9 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status_parts = []
     if profile['is_premium']: status_parts.append("Premium")
     if profile['is_trusted']: status_parts.append("Trusted User 🛡️")
-    status = ", ".join(status_parts) if status_parts else "Non-Premium"
+    raw_status = ", ".join(status_parts) if status_parts else "Non-Premium"
+    status = escape_markdown(raw_status, version=2)
+
     shadow_banned_status = "Yes" if profile['is_shadow_banned'] else "No"
 
     profile_text = (

@@ -1,6 +1,5 @@
 import logging
 import os
-from collections import deque
 import asyncio
 import time
 import re
@@ -11,6 +10,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.helpers import escape_markdown
 
 import database
+import session
 
 # Load environment variables from .env file
 load_dotenv()
@@ -40,12 +40,6 @@ REP_CHANGE_FALSE_REPORT = -2
 
 FORBIDDEN_WORDS = {"spam", "promo", "sale", "vulgarword"}
 
-# --- In-memory Session Data ---
-waiting_premium_users = deque()
-waiting_users = deque()
-active_chats = {}
-user_behavior_tracker = {}
-
 # --- Helper Functions ---
 
 def is_message_suspicious(text: str) -> bool:
@@ -69,38 +63,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Your reputation is too low to start a new chat.")
         return
 
-    if user_id in active_chats:
+    if session.get_partner_id(user_id):
         await update.message.reply_text("You are already in a chat. Use /stop to end it.")
         return
 
-    if user_id in waiting_users or user_id in waiting_premium_users:
+    # Check if user is already in any waiting queue
+    waiting_premium, waiting_regular = session.get_waiting_users()
+    if str(user_id) in waiting_premium or str(user_id) in waiting_regular:
         await update.message.reply_text("You are already looking for a partner. Please wait.")
         return
 
-    user_behavior_tracker[user_id] = {
-        'last_message_time': None,
-        'message_sent': False,
+    session.set_behavior_tracker(user_id, {
         'start_time': time.time(),
-        'delay_notified': False # Flag for one-time notification
-    }
+        'message_sent': False,
+        'delay_notified': False
+    })
+
+    session.add_to_waiting_queue(user_id, is_premium=profile['is_premium'])
 
     if profile['is_premium']:
-        waiting_premium_users.append(user_id)
         await update.message.reply_text("👑 Searching for a partner with high priority... Please wait.")
     else:
-        waiting_users.append(user_id)
         await update.message.reply_text("🔎 Searching for a partner... Please wait.")
 
-    logger.info(f"User {user_id} (Rep: {profile['reputation']}) started searching.")
+    logger.info(f"User {user_id} (Rep: {profile['reputation']}) added to waiting queue.")
     await try_match_users(context)
 
 async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_TYPE, is_next: bool = False):
-    if user_id not in active_chats:
+    partner_id = session.end_chat_session(user_id)
+
+    if not partner_id:
         if not is_next: await context.bot.send_message(chat_id=user_id, text="You are not in a chat. Use /start to find one.")
         return False
 
-    partner_id = active_chats[user_id]
-    tracker = user_behavior_tracker.get(user_id)
+    tracker = session.get_behavior_tracker(user_id)
 
     if tracker:
         chat_duration = time.time() - tracker.get('start_time', 0)
@@ -111,7 +107,7 @@ async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_
             keyboard = [[InlineKeyboardButton("✅ Yes", callback_data=f"validate_yes_{user_id}"), InlineKeyboardButton("❌ No", callback_data=f"validate_no_{user_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(chat_id=partner_id, text="⚠️ Your partner left right after sending a message. Was it a vulgar or promotional message?", reply_markup=reply_markup)
-        elif chat_duration > 60: # Normal chat > 1 min
+        elif chat_duration > 60:
             profile = database.get_user_profile(user_id)
             database.update_user_profile(user_id, {'reputation': profile['reputation'] + REP_CHANGE_NORMAL_CHAT})
             partner_profile = database.get_user_profile(partner_id)
@@ -120,11 +116,8 @@ async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_
     if not is_next: await context.bot.send_message(chat_id=user_id, text="💬 You have left the chat.")
     await context.bot.send_message(chat_id=partner_id, text="💬 Your partner has left the chat.")
 
-    del active_chats[user_id]
-    del active_chats[partner_id]
-
-    if user_id in user_behavior_tracker: del user_behavior_tracker[user_id]
-    if partner_id in user_behavior_tracker: del user_behavior_tracker[partner_id]
+    session.remove_behavior_tracker(user_id)
+    session.remove_behavior_tracker(partner_id)
 
     logger.info(f"Chat ended between {user_id} and {partner_id}.")
     return True
@@ -146,7 +139,6 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if profile['is_trusted']: status_parts.append("Trusted User 🛡️")
     raw_status = ", ".join(status_parts) if status_parts else "Non-Premium"
     status = escape_markdown(raw_status, version=2)
-
     shadow_banned_status = "Yes" if profile['is_shadow_banned'] else "No"
 
     profile_text = (
@@ -161,7 +153,9 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    if user_id not in active_chats:
+    partner_id = session.get_partner_id(user_id)
+
+    if not partner_id:
         await update.message.reply_text("You are not in a chat. Use /start to find one.")
         return
 
@@ -171,24 +165,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if profile['reputation'] <= REPUTATION_LEVEL_MONITORED:
-        tracker = user_behavior_tracker.get(user_id, {})
+        tracker = session.get_behavior_tracker(user_id) or {}
         if not tracker.get('delay_notified', False):
             await update.message.reply_text("Your messages are being sent with a slight delay due to your low reputation score.", disable_notification=True)
             tracker['delay_notified'] = True
+            session.set_behavior_tracker(user_id, tracker)
         await asyncio.sleep(3)
 
-    partner_id = active_chats[user_id]
     message = update.message
-
     if message.text and is_message_suspicious(message.text):
         new_rep = profile['reputation'] + REP_CHANGE_SUSPICIOUS_MESSAGE
         database.update_user_profile(user_id, {'reputation': new_rep})
         await update.message.reply_text("Your message was flagged as suspicious and your reputation has been lowered.", disable_notification=True)
         return
 
-    if user_id in user_behavior_tracker:
-        user_behavior_tracker[user_id]['message_sent'] = True
-        user_behavior_tracker[user_id]['last_message_time'] = time.time()
+    tracker = session.get_behavior_tracker(user_id) or {}
+    tracker['message_sent'] = True
+    tracker['last_message_time'] = time.time()
+    session.set_behavior_tracker(user_id, tracker)
 
     if message.text: await context.bot.send_message(chat_id=partner_id, text=message.text)
     elif message.photo: await context.bot.send_photo(chat_id=partner_id, photo=message.photo[-1].file_id)
@@ -230,37 +224,26 @@ async def handle_validation_callback(update: Update, context: ContextTypes.DEFAU
         logger.info(f"User {reporter_user_id} penalized for a false report.")
         await query.edit_message_text(text="Thank you for your feedback. No action was taken against the other user.")
 
-def _check_reciprocal_match(user1_profile: dict, user2_profile: dict) -> bool:
-    # Check gender and region
+def _check_reciprocal_match(user1_id: int, user2_id: int) -> bool:
+    user1_profile = database.get_user_profile(user1_id)
+    user2_profile = database.get_user_profile(user2_id)
     for key in ['gender', 'region']:
         if user1_profile['preferences'].get(key) is not None and user1_profile['preferences'][key] != user2_profile.get(key):
             return False
         if user2_profile['preferences'].get(key) is not None and user2_profile['preferences'][key] != user1_profile.get(key):
             return False
-
-    # Check age preference
-    u1_age_pref = user1_profile['preferences'].get('age')
-    u2_age_pref = user2_profile['preferences'].get('age')
-    u1_age = user1_profile.get('age')
-    u2_age = user2_profile.get('age')
-
-    if u1_age_pref is not None and u2_age is not None:
-        if abs(u1_age_pref - u2_age) > 5: # Example: allow 5-year age difference
-            return False
-    if u2_age_pref is not None and u1_age is not None:
-        if abs(u2_age_pref - u1_age) > 5:
-            return False
-
+    u1_age_pref, u2_age_pref = user1_profile['preferences'].get('age'), user2_profile['preferences'].get('age')
+    u1_age, u2_age = user1_profile.get('age'), user2_profile.get('age')
+    if u1_age_pref is not None and u2_age is not None and abs(u1_age_pref - u2_age) > 5: return False
+    if u2_age_pref is not None and u1_age is not None and abs(u2_age_pref - u1_age) > 5: return False
     return True
 
 async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global waiting_users, waiting_premium_users
-    unmatched_premium = deque()
-    matched_in_phase1 = set()
+    premium_q, regular_q = [deque(q) for q in session.get_waiting_users()]
 
-    while waiting_premium_users:
-        p_user_id = waiting_premium_users.popleft()
-        if p_user_id in matched_in_phase1: continue
+    unmatched_premium = deque()
+    while premium_q:
+        p_user_id = int(premium_q.popleft())
         p_profile = database.get_user_profile(p_user_id)
         if p_profile['is_shadow_banned']: continue
         has_prefs = any(v is not None for v in p_profile['preferences'].values())
@@ -268,30 +251,30 @@ async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None:
             unmatched_premium.append(p_user_id)
             continue
         found_match = False
-        potential_partners = list(waiting_premium_users) + list(waiting_users)
-        for partner_id in potential_partners:
-            partner_profile = database.get_user_profile(partner_id)
-            if _check_reciprocal_match(p_profile, partner_profile):
+        potential_partners = list(premium_q) + list(regular_q)
+        for partner_id_str in potential_partners:
+            partner_id = int(partner_id_str)
+            if _check_reciprocal_match(p_user_id, partner_id):
                 await _create_chat(p_user_id, partner_id, context)
-                if partner_id in waiting_premium_users: waiting_premium_users.remove(partner_id)
-                else: waiting_users.remove(partner_id)
+                if str(partner_id) in premium_q: premium_q.remove(str(partner_id))
+                else: regular_q.remove(str(partner_id))
                 found_match = True
                 break
         if not found_match:
             unmatched_premium.append(p_user_id)
-    waiting_premium_users = unmatched_premium
-    while len(waiting_premium_users) >= 2:
-        await _create_chat(waiting_premium_users.popleft(), waiting_premium_users.popleft(), context)
-    if len(waiting_premium_users) == 1 and len(waiting_users) >= 1:
-        await _create_chat(waiting_premium_users.popleft(), waiting_users.popleft(), context)
-    while len(waiting_users) >= 2:
-        await _create_chat(waiting_users.popleft(), waiting_users.popleft(), context)
+
+    # Match remaining users without preferences
+    while len(unmatched_premium) >= 2:
+        await _create_chat(unmatched_premium.popleft(), unmatched_premium.popleft(), context)
+    if len(unmatched_premium) == 1 and len(regular_q) >= 1:
+        await _create_chat(unmatched_premium.popleft(), int(regular_q.popleft()), context)
+    while len(regular_q) >= 2:
+        await _create_chat(int(regular_q.popleft()), int(regular_q.popleft()), context)
 
 async def _create_chat(user1_id: int, user2_id: int, context: ContextTypes.DEFAULT_TYPE):
-    active_chats[user1_id] = user2_id
-    active_chats[user2_id] = user1_id
-    user_behavior_tracker[user1_id] = {'last_message_time': None, 'message_sent': False, 'start_time': time.time(), 'delay_notified': False}
-    user_behavior_tracker[user2_id] = {'last_message_time': None, 'message_sent': False, 'start_time': time.time(), 'delay_notified': False}
+    session.start_chat_session(user1_id, user2_id)
+    session.set_behavior_tracker(user1_id, {'start_time': time.time(), 'message_sent': False, 'delay_notified': False})
+    session.set_behavior_tracker(user2_id, {'start_time': time.time(), 'message_sent': False, 'delay_notified': False})
     logger.info(f"Matched {user1_id} and {user2_id}.")
     await context.bot.send_message(chat_id=user1_id, text="✅ Partner found! You can start chatting.")
     await context.bot.send_message(chat_id=user2_id, text="✅ Partner found! You can start chatting.")
@@ -331,9 +314,10 @@ async def maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Usage: /maintenance <announcement_message>")
         return
     full_message = f"🔧 **Maintenance Announcement** 🔧\n\n{message_to_send}"
-    await update.message.reply_text(f"📢 Starting maintenance broadcast to {len(database.get_all_user_ids())} users...")
+    user_ids = database.get_all_user_ids()
+    await update.message.reply_text(f"📢 Starting maintenance broadcast to {len(user_ids)} users...")
     success_count, fail_count = 0, 0
-    for user_id in database.get_all_user_ids():
+    for user_id in user_ids:
         try:
             await context.bot.send_message(chat_id=user_id, text=full_message, parse_mode='Markdown')
             success_count += 1
@@ -352,13 +336,13 @@ async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS: return
     all_user_ids = database.get_all_user_ids()
-    all_profiles = [database.get_user_profile(uid) for uid in all_user_ids]
-    shadow_banned_count = sum(1 for p in all_profiles if p and p['is_shadow_banned'])
+    shadow_banned_count = sum(1 for uid in all_user_ids if database.get_user_profile(uid)['is_shadow_banned'])
+    prem_q_len, reg_q_len = session.get_queue_lengths()
     stats_text = (
         f"📊 *Bot Dashboard*\n\n"
-        f"Active Chats: {len(active_chats) // 2}\n"
-        f"Waiting Users (Premium): {len(waiting_premium_users)}\n"
-        f"Waiting Users (Regular): {len(waiting_users)}\n"
+        f"Active Chats: {session.get_active_chat_count()}\n"
+        f"Waiting Users (Premium): {prem_q_len}\n"
+        f"Waiting Users (Regular): {reg_q_len}\n"
         f"Total Unique Profiles: {len(all_user_ids)}\n"
         f"Shadow Banned Users: {shadow_banned_count}"
     )
@@ -394,7 +378,6 @@ async def trustuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"User {user_id_to_trust} has been marked as a Trusted User.")
 
 async def bansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bans a sticker by replying to it with this command."""
     if update.effective_user.id not in ADMIN_IDS: return
     if not update.message.reply_to_message or not update.message.reply_to_message.sticker:
         await update.message.reply_text("Please reply to a sticker to ban it.")
@@ -403,33 +386,27 @@ async def bansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     database.add_banned_sticker(sticker.file_unique_id, sticker.file_id)
     await update.message.reply_text("Sticker has been banned successfully.")
 
-async def listbannedstickers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lists all banned stickers by sending them."""
+async def unbansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS: return
+    if not update.message.reply_to_message or not update.message.reply_to_message.sticker:
+        await update.message.reply_text("Please reply to a sticker to unban it.")
+        return
+    sticker_id = update.message.reply_to_message.sticker.file_unique_id
+    database.remove_banned_sticker(sticker_id)
+    await update.message.reply_text("Sticker has been unbanned successfully.")
 
+async def listbannedstickers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
     banned_stickers = database.get_all_banned_stickers()
     if not banned_stickers:
         await update.message.reply_text("There are no banned stickers.")
         return
-
     await update.message.reply_text("📋 **Banned Stickers:**")
     for sticker in banned_stickers:
         try:
             await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=sticker['sticker_file_id'])
         except Exception as e:
             await update.message.reply_text(f"Could not send sticker with unique_id: `{sticker['sticker_unique_id']}`\nError: {e}", parse_mode='MarkdownV2')
-
-async def unbansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unbans a sticker by replying to it with this command."""
-    if update.effective_user.id not in ADMIN_IDS: return
-
-    if not update.message.reply_to_message or not update.message.reply_to_message.sticker:
-        await update.message.reply_text("Please reply to a sticker to unban it.")
-        return
-
-    sticker_id = update.message.reply_to_message.sticker.file_unique_id
-    database.remove_banned_sticker(sticker_id)
-    await update.message.reply_text("Sticker has been unbanned successfully.")
 
 def main() -> None:
     database.initialize_database()

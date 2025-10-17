@@ -14,10 +14,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Admin and Maintenance ---
+# --- Admin ---
 ADMIN_IDS = set(int(admin_id) for admin_id in os.getenv("ADMIN_IDS", "").split(',') if admin_id)
-maintenance_mode = False
-maintenance_message = "🔧 Bot is under maintenance. Please try again later."
 
 # --- Constants ---
 DEFAULT_REPUTATION = 80
@@ -46,7 +44,7 @@ user_behavior_tracker = {}
 
 def get_or_create_user_profile(user_id: int) -> dict:
     if user_id not in user_profiles:
-        is_premium = user_id in ADMIN_IDS # Admins are premium by default
+        is_premium = user_id in ADMIN_IDS
 
         user_profiles[user_id] = {
             'reputation': PREMIUM_REPUTATION if is_premium else DEFAULT_REPUTATION,
@@ -77,12 +75,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     profile = get_or_create_user_profile(user_id)
 
-    if maintenance_mode and user_id not in ADMIN_IDS:
-        await update.message.reply_text(maintenance_message)
-        return
-
     if profile['is_shadow_banned']:
-        await update.message.reply_text("🔎 Searching for a partner... Please wait.") # Pretend to search
+        await update.message.reply_text("🔎 Searching for a partner... Please wait.")
         logger.warning(f"Shadow-banned user {user_id} attempted to start a chat.")
         return
 
@@ -225,11 +219,9 @@ async def handle_validation_callback(update: Update, context: ContextTypes.DEFAU
 
 def _check_reciprocal_match(user1_profile: dict, user2_profile: dict) -> bool:
     """Checks if two users' preferences are mutually compatible."""
-    # Check if user2 matches user1's preferences
     for key, value in user1_profile['preferences'].items():
         if value is not None and user2_profile.get(key) != value:
             return False
-    # Check if user1 matches user2's preferences
     for key, value in user2_profile['preferences'].items():
         if value is not None and user1_profile.get(key) != value:
             return False
@@ -238,54 +230,38 @@ def _check_reciprocal_match(user1_profile: dict, user2_profile: dict) -> bool:
 async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None:
     """The main matchmaking logic with preference handling."""
     global waiting_users, waiting_premium_users
-
-    # --- Phase 1: Match premium users with preferences ---
     unmatched_premium = deque()
     matched_in_phase1 = set()
 
     while waiting_premium_users:
         p_user_id = waiting_premium_users.popleft()
         if p_user_id in matched_in_phase1: continue
-
         p_profile = get_or_create_user_profile(p_user_id)
         has_prefs = any(v is not None for v in p_profile['preferences'].values())
-
         if not has_prefs:
             unmatched_premium.append(p_user_id)
             continue
-
-        # Search for a preferred partner
         found_match = False
-        # Search in other premium users first
         for i, other_p_id in enumerate(list(waiting_premium_users)):
             if _check_reciprocal_match(p_profile, get_or_create_user_profile(other_p_id)):
                 await _create_chat(p_user_id, other_p_id, context)
                 waiting_premium_users.remove(other_p_id)
                 found_match = True
                 break
-
         if not found_match:
-            # Search in regular users
             for i, r_user_id in enumerate(list(waiting_users)):
                 if _check_reciprocal_match(p_profile, get_or_create_user_profile(r_user_id)):
                     await _create_chat(p_user_id, r_user_id, context)
                     waiting_users.remove(r_user_id)
                     found_match = True
                     break
-
         if not found_match:
             unmatched_premium.append(p_user_id)
-
     waiting_premium_users = unmatched_premium
-
-    # --- Phase 2: Match remaining premium users (no pref match found) ---
     while len(waiting_premium_users) >= 2:
         await _create_chat(waiting_premium_users.popleft(), waiting_premium_users.popleft(), context)
-
     if len(waiting_premium_users) == 1 and len(waiting_users) >= 1:
         await _create_chat(waiting_premium_users.popleft(), waiting_users.popleft(), context)
-
-    # --- Phase 3: Match regular users ---
     while len(waiting_users) >= 2:
         await _create_chat(waiting_users.popleft(), waiting_users.popleft(), context)
 
@@ -301,41 +277,40 @@ async def _create_chat(user1_id: int, user2_id: int, context: ContextTypes.DEFAU
 async def set_preference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     profile = get_or_create_user_profile(user_id)
-
     if not profile['is_premium']:
         await update.message.reply_text("This feature is only available for premium users.")
         return
-
     args = context.args
     if len(args) != 2:
         await update.message.reply_text("Usage: /set_preference <type> <value>\nExample: /set_preference gender female")
         return
-
     pref_type, pref_value = args[0].lower(), args[1].lower()
     if pref_type not in profile['preferences']:
         await update.message.reply_text(f"Invalid preference type. Available: {', '.join(profile['preferences'].keys())}")
         return
-
-    # In a real bot, you'd add more validation for pref_value
     profile['preferences'][pref_type] = pref_value
     logger.info(f"User {user_id} set preference {pref_type} to {pref_value}.")
     await update.message.reply_text(f"Preference '{pref_type}' has been set to '{pref_value}'.")
 
 async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global maintenance_mode, maintenance_message
+    """Broadcasts a maintenance announcement to all users."""
     if update.effective_user.id not in ADMIN_IDS: return
-    maintenance_mode = True
-    custom_message = ' '.join(context.args)
-    if custom_message: maintenance_message = custom_message
-    logger.info(f"Maintenance mode enabled. Message: {maintenance_message}")
-    await update.message.reply_text(f"✅ Maintenance mode enabled.\nMessage: {maintenance_message}")
-
-async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global maintenance_mode
-    if update.effective_user.id not in ADMIN_IDS: return
-    maintenance_mode = False
-    logger.info(f"Maintenance mode disabled.")
-    await update.message.reply_text("✅ Bot has been resumed.")
+    message_to_send = ' '.join(context.args)
+    if not message_to_send:
+        await update.message.reply_text("Usage: /maintenance <announcement_message>")
+        return
+    full_message = f"🔧 **Maintenance Announcement** 🔧\n\n{message_to_send}"
+    await update.message.reply_text(f"📢 Starting maintenance broadcast to {len(user_profiles)} users...")
+    success_count, fail_count = 0, 0
+    for user_id in user_profiles.keys():
+        try:
+            await context.bot.send_message(chat_id=user_id, text=full_message, parse_mode='Markdown')
+            success_count += 1
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            fail_count += 1
+            logger.error(f"Failed to send maintenance broadcast to {user_id}: {e}")
+    await update.message.reply_text(f"Maintenance broadcast finished.\n✅ Sent: {success_count}\n❌ Failed: {fail_count}")
 
 async def shutdown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS: return
@@ -346,9 +321,7 @@ async def shutdown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Displays real-time bot statistics."""
     if update.effective_user.id not in ADMIN_IDS: return
-
     shadow_banned_count = sum(1 for p in user_profiles.values() if p['is_shadow_banned'])
-
     stats_text = (
         f"📊 *Bot Dashboard*\n\n"
         f"Active Chats: {len(active_chats) // 2}\n"
@@ -362,49 +335,39 @@ async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a message to all users who have ever started the bot."""
     if update.effective_user.id not in ADMIN_IDS: return
-
     message_to_send = ' '.join(context.args)
     if not message_to_send:
         await update.message.reply_text("Usage: /broadcast <message>")
         return
-
     await update.message.reply_text(f"📢 Starting broadcast to {len(user_profiles)} users. This may take a while...")
-
-    success_count = 0
-    fail_count = 0
+    success_count, fail_count = 0, 0
     for user_id in user_profiles.keys():
         try:
             await context.bot.send_message(chat_id=user_id, text=message_to_send)
             success_count += 1
-            await asyncio.sleep(0.1) # To avoid rate limiting
+            await asyncio.sleep(0.1)
         except Exception as e:
             fail_count += 1
             logger.error(f"Failed to send broadcast to {user_id}: {e}")
-
     await update.message.reply_text(f"Broadcast finished.\n✅ Sent: {success_count}\n❌ Failed: {fail_count}")
 
 async def trust_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Marks a user as trusted."""
     if update.effective_user.id not in ADMIN_IDS: return
-
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("Usage: /trust_user <user_id>")
         return
-
     user_id_to_trust = int(context.args[0])
     profile = get_or_create_user_profile(user_id_to_trust)
     profile['is_trusted'] = True
-
     logger.info(f"Admin {update.effective_user.id} marked user {user_id_to_trust} as trusted.")
     await update.message.reply_text(f"User {user_id_to_trust} has been marked as a Trusted User.")
-
 
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN environment variable not set.")
         return
-
     application = Application.builder().token(token).build()
 
     # Command Handlers
@@ -416,7 +379,6 @@ def main() -> None:
 
     # Admin Commands
     application.add_handler(CommandHandler("maintenance", maintenance_cmd))
-    application.add_handler(CommandHandler("resume", resume_cmd))
     application.add_handler(CommandHandler("shutdown", shutdown_cmd))
     application.add_handler(CommandHandler("dashboard", dashboard_cmd))
     application.add_handler(CommandHandler("broadcast", broadcast_cmd))

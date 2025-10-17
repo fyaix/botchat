@@ -4,9 +4,15 @@ from collections import deque
 import asyncio
 import time
 import re
+from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+
+import database
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Enable logging
 logging.basicConfig(
@@ -18,50 +24,22 @@ logger = logging.getLogger(__name__)
 ADMIN_IDS = set(int(admin_id) for admin_id in os.getenv("ADMIN_IDS", "").split(',') if admin_id)
 
 # --- Constants ---
-DEFAULT_REPUTATION = 80
-PREMIUM_REPUTATION = 100
 REPUTATION_LEVEL_MONITORED = 79
 REPUTATION_LEVEL_RISKY = 59
 REPUTATION_LEVEL_SUSPENDED = 40
 MAX_VIOLATIONS_BEFORE_SHADOW_BAN = 3
-
-# Behavior constants
 SUSPICIOUS_SKIP_TIME_SECONDS = 5
 REPUTATION_PENALTY_SUSPICIOUS_MESSAGE = -2
 REPUTATION_PENALTY_CONFIRMED_SPAM = -5
-
-# A simple set of forbidden words for content filtering
 FORBIDDEN_WORDS = {"spam", "promo", "sale", "vulgarword"}
 
-# --- Data Structures ---
-user_profiles = {}
+# --- In-memory Session Data ---
 waiting_premium_users = deque()
 waiting_users = deque()
 active_chats = {}
 user_behavior_tracker = {}
 
 # --- Helper Functions ---
-
-def get_or_create_user_profile(user_id: int) -> dict:
-    if user_id not in user_profiles:
-        is_premium = user_id in ADMIN_IDS
-
-        user_profiles[user_id] = {
-            'reputation': PREMIUM_REPUTATION if is_premium else DEFAULT_REPUTATION,
-            'is_premium': is_premium,
-            'is_trusted': False,
-            'is_shadow_banned': False,
-            'violation_count': 0,
-            'preferences': {'gender': None, 'region': None}
-        }
-        logger.info(f"Created new profile for user {user_id}.")
-    return user_profiles[user_id]
-
-def update_reputation(user_id: int, change: int):
-    profile = get_or_create_user_profile(user_id)
-    current_reputation = profile['reputation']
-    profile['reputation'] = max(0, min(100, current_reputation + change))
-    logger.info(f"Reputation for user {user_id} updated from {current_reputation} to {profile['reputation']} (Change: {change}).")
 
 def is_message_suspicious(text: str) -> bool:
     text_lower = text.lower()
@@ -73,7 +51,7 @@ def is_message_suspicious(text: str) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    profile = get_or_create_user_profile(user_id)
+    profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
 
     if profile['is_shadow_banned']:
         await update.message.reply_text("🔎 Searching for a partner... Please wait.")
@@ -120,8 +98,11 @@ async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_
             reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(chat_id=partner_id, text="⚠️ Your partner left right after sending a message. Was it a vulgar or promotional message?", reply_markup=reply_markup)
         else:
-            update_reputation(user_id, 1)
-            update_reputation(partner_id, 1)
+            profile = database.get_user_profile(user_id)
+            database.update_user_profile(user_id, {'reputation': profile['reputation'] + 1})
+            partner_profile = database.get_user_profile(partner_id)
+            database.update_user_profile(partner_id, {'reputation': partner_profile['reputation'] + 1})
+
 
     if not is_next: await context.bot.send_message(chat_id=user_id, text="💬 You have left the chat.")
     await context.bot.send_message(chat_id=partner_id, text="💬 Your partner has left the chat.")
@@ -145,13 +126,12 @@ async def next_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    profile = get_or_create_user_profile(user_id)
+    profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
 
     status_parts = []
     if profile['is_premium']: status_parts.append("Premium")
     if profile['is_trusted']: status_parts.append("Trusted User 🛡️")
     status = ", ".join(status_parts) if status_parts else "Non-Premium"
-
     shadow_banned_status = "Yes" if profile['is_shadow_banned'] else "No"
 
     profile_text = (
@@ -170,7 +150,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("You are not in a chat. Use /start to find one.")
         return
 
-    profile = get_or_create_user_profile(user_id)
+    profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
     if profile['reputation'] <= REPUTATION_LEVEL_RISKY and update.message.sticker:
         await update.message.reply_text("Your reputation is too low to send stickers.")
         return
@@ -183,7 +163,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message = update.message
 
     if message.text and is_message_suspicious(message.text):
-        update_reputation(user_id, REPUTATION_PENALTY_SUSPICIOUS_MESSAGE)
+        new_rep = profile['reputation'] + REPUTATION_PENALTY_SUSPICIOUS_MESSAGE
+        database.update_user_profile(user_id, {'reputation': new_rep})
         await update.message.reply_text("Your message was flagged as suspicious and your reputation has been lowered.", disable_notification=True)
         return
 
@@ -205,30 +186,35 @@ async def handle_validation_callback(update: Update, context: ContextTypes.DEFAU
     data = query.data.split('_')
     action, reported_user_id_str = data[1], data[2]
     reported_user_id = int(reported_user_id_str)
-    profile = get_or_create_user_profile(reported_user_id)
+    profile = database.get_or_create_user_profile(reported_user_id, admin_ids=ADMIN_IDS)
 
     if action == "yes":
-        update_reputation(reported_user_id, REPUTATION_PENALTY_CONFIRMED_SPAM)
-        profile['violation_count'] += 1
-        if profile['violation_count'] >= MAX_VIOLATIONS_BEFORE_SHADOW_BAN:
-            profile['is_shadow_banned'] = True
+        updates = {
+            'reputation': profile['reputation'] + REPUTATION_PENALTY_CONFIRMED_SPAM,
+            'violation_count': profile['violation_count'] + 1
+        }
+        if updates['violation_count'] >= MAX_VIOLATIONS_BEFORE_SHADOW_BAN:
+            updates['is_shadow_banned'] = True
             logger.warning(f"User {reported_user_id} has been shadow banned.")
+        database.update_user_profile(reported_user_id, updates)
         await query.edit_message_text(text="Thank you. The user has been penalized.")
     else:
         await query.edit_message_text(text="Thank you for your feedback.")
 
-def _check_reciprocal_match(user1_profile: dict, user2_profile: dict) -> bool:
-    """Checks if two users' preferences are mutually compatible."""
+def _check_reciprocal_match(user1_id: int, user2_id: int) -> bool:
+    user1_profile = database.get_user_profile(user1_id)
+    user2_profile = database.get_user_profile(user2_id)
+    # Check if user2 matches user1's preferences
     for key, value in user1_profile['preferences'].items():
         if value is not None and user2_profile.get(key) != value:
             return False
+    # Check if user1 matches user2's preferences
     for key, value in user2_profile['preferences'].items():
         if value is not None and user1_profile.get(key) != value:
             return False
     return True
 
 async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """The main matchmaking logic with preference handling."""
     global waiting_users, waiting_premium_users
     unmatched_premium = deque()
     matched_in_phase1 = set()
@@ -236,21 +222,22 @@ async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None:
     while waiting_premium_users:
         p_user_id = waiting_premium_users.popleft()
         if p_user_id in matched_in_phase1: continue
-        p_profile = get_or_create_user_profile(p_user_id)
+        p_profile = database.get_user_profile(p_user_id)
+        if p_profile['is_shadow_banned']: continue
         has_prefs = any(v is not None for v in p_profile['preferences'].values())
         if not has_prefs:
             unmatched_premium.append(p_user_id)
             continue
         found_match = False
-        for i, other_p_id in enumerate(list(waiting_premium_users)):
-            if _check_reciprocal_match(p_profile, get_or_create_user_profile(other_p_id)):
+        for other_p_id in list(waiting_premium_users):
+            if _check_reciprocal_match(p_user_id, other_p_id):
                 await _create_chat(p_user_id, other_p_id, context)
                 waiting_premium_users.remove(other_p_id)
                 found_match = True
                 break
         if not found_match:
-            for i, r_user_id in enumerate(list(waiting_users)):
-                if _check_reciprocal_match(p_profile, get_or_create_user_profile(r_user_id)):
+            for r_user_id in list(waiting_users):
+                if _check_reciprocal_match(p_user_id, r_user_id):
                     await _create_chat(p_user_id, r_user_id, context)
                     waiting_users.remove(r_user_id)
                     found_match = True
@@ -273,10 +260,9 @@ async def _create_chat(user1_id: int, user2_id: int, context: ContextTypes.DEFAU
     await context.bot.send_message(chat_id=user2_id, text="✅ Partner found! You can start chatting.")
 
 # --- Premium & Admin Commands ---
-
 async def set_preference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    profile = get_or_create_user_profile(user_id)
+    profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
     if not profile['is_premium']:
         await update.message.reply_text("This feature is only available for premium users.")
         return
@@ -288,21 +274,22 @@ async def set_preference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if pref_type not in profile['preferences']:
         await update.message.reply_text(f"Invalid preference type. Available: {', '.join(profile['preferences'].keys())}")
         return
-    profile['preferences'][pref_type] = pref_value
+    new_prefs = profile['preferences']
+    new_prefs[pref_type] = pref_value
+    database.update_user_profile(user_id, {'preferences': new_prefs})
     logger.info(f"User {user_id} set preference {pref_type} to {pref_value}.")
     await update.message.reply_text(f"Preference '{pref_type}' has been set to '{pref_value}'.")
 
 async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Broadcasts a maintenance announcement to all users."""
     if update.effective_user.id not in ADMIN_IDS: return
     message_to_send = ' '.join(context.args)
     if not message_to_send:
         await update.message.reply_text("Usage: /maintenance <announcement_message>")
         return
     full_message = f"🔧 **Maintenance Announcement** 🔧\n\n{message_to_send}"
-    await update.message.reply_text(f"📢 Starting maintenance broadcast to {len(user_profiles)} users...")
+    await update.message.reply_text(f"📢 Starting maintenance broadcast to {len(database.get_all_user_ids())} users...")
     success_count, fail_count = 0, 0
-    for user_id in user_profiles.keys():
+    for user_id in database.get_all_user_ids():
         try:
             await context.bot.send_message(chat_id=user_id, text=full_message, parse_mode='Markdown')
             success_count += 1
@@ -319,29 +306,30 @@ async def shutdown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     asyncio.create_task(context.application.shutdown())
 
 async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Displays real-time bot statistics."""
     if update.effective_user.id not in ADMIN_IDS: return
-    shadow_banned_count = sum(1 for p in user_profiles.values() if p['is_shadow_banned'])
+    # This could be more efficient by doing a COUNT in SQL
+    all_profiles = [database.get_user_profile(uid) for uid in database.get_all_user_ids()]
+    shadow_banned_count = sum(1 for p in all_profiles if p and p['is_shadow_banned'])
     stats_text = (
         f"📊 *Bot Dashboard*\n\n"
         f"Active Chats: {len(active_chats) // 2}\n"
         f"Waiting Users (Premium): {len(waiting_premium_users)}\n"
         f"Waiting Users (Regular): {len(waiting_users)}\n"
-        f"Total Unique Profiles: {len(user_profiles)}\n"
+        f"Total Unique Profiles: {len(all_profiles)}\n"
         f"Shadow Banned Users: {shadow_banned_count}"
     )
     await update.message.reply_text(stats_text, parse_mode='MarkdownV2')
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a message to all users who have ever started the bot."""
     if update.effective_user.id not in ADMIN_IDS: return
     message_to_send = ' '.join(context.args)
     if not message_to_send:
         await update.message.reply_text("Usage: /broadcast <message>")
         return
-    await update.message.reply_text(f"📢 Starting broadcast to {len(user_profiles)} users. This may take a while...")
+    user_ids = database.get_all_user_ids()
+    await update.message.reply_text(f"📢 Starting broadcast to {len(user_ids)} users. This may take a while...")
     success_count, fail_count = 0, 0
-    for user_id in user_profiles.keys():
+    for user_id in user_ids:
         try:
             await context.bot.send_message(chat_id=user_id, text=message_to_send)
             success_count += 1
@@ -352,18 +340,19 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(f"Broadcast finished.\n✅ Sent: {success_count}\n❌ Failed: {fail_count}")
 
 async def trust_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Marks a user as trusted."""
     if update.effective_user.id not in ADMIN_IDS: return
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("Usage: /trust_user <user_id>")
         return
     user_id_to_trust = int(context.args[0])
-    profile = get_or_create_user_profile(user_id_to_trust)
-    profile['is_trusted'] = True
+    database.update_user_profile(user_id_to_trust, {'is_trusted': True})
     logger.info(f"Admin {update.effective_user.id} marked user {user_id_to_trust} as trusted.")
     await update.message.reply_text(f"User {user_id_to_trust} has been marked as a Trusted User.")
 
 def main() -> None:
+    # Initialize the database first
+    database.initialize_database()
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN environment variable not set.")
@@ -389,6 +378,8 @@ def main() -> None:
     message_handler = MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_message)
     application.add_handler(message_handler)
 
+    # Use polling for local development
+    logger.info("Starting bot in polling mode...")
     application.run_polling()
 
 if __name__ == "__main__":

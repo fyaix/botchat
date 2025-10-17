@@ -76,7 +76,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("You are already looking for a partner. Please wait.")
         return
 
-    user_behavior_tracker[user_id] = {'last_message_time': None, 'message_sent': False, 'start_time': time.time()}
+    user_behavior_tracker[user_id] = {
+        'last_message_time': None,
+        'message_sent': False,
+        'start_time': time.time(),
+        'delay_notified': False # Flag for one-time notification
+    }
 
     if profile['is_premium']:
         waiting_premium_users.append(user_id)
@@ -163,7 +168,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if profile['reputation'] <= REPUTATION_LEVEL_MONITORED:
-        await update.message.reply_text("Your message is being sent with a slight delay due to your reputation score.", disable_notification=True)
+        tracker = user_behavior_tracker.get(user_id, {})
+        if not tracker.get('delay_notified', False):
+            await update.message.reply_text("Your messages are being sent with a slight delay due to your low reputation score.", disable_notification=True)
+            tracker['delay_notified'] = True
         await asyncio.sleep(3)
 
     partner_id = active_chats[user_id]
@@ -279,14 +287,14 @@ async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _create_chat(user1_id: int, user2_id: int, context: ContextTypes.DEFAULT_TYPE):
     active_chats[user1_id] = user2_id
     active_chats[user2_id] = user1_id
-    user_behavior_tracker[user1_id] = {'last_message_time': None, 'message_sent': False, 'start_time': time.time()}
-    user_behavior_tracker[user2_id] = {'last_message_time': None, 'message_sent': False, 'start_time': time.time()}
+    user_behavior_tracker[user1_id] = {'last_message_time': None, 'message_sent': False, 'start_time': time.time(), 'delay_notified': False}
+    user_behavior_tracker[user2_id] = {'last_message_time': None, 'message_sent': False, 'start_time': time.time(), 'delay_notified': False}
     logger.info(f"Matched {user1_id} and {user2_id}.")
     await context.bot.send_message(chat_id=user1_id, text="✅ Partner found! You can start chatting.")
     await context.bot.send_message(chat_id=user2_id, text="✅ Partner found! You can start chatting.")
 
 # --- Premium & Admin Commands ---
-async def set_preference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def setpreference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
     if not profile['is_premium']:
@@ -294,7 +302,7 @@ async def set_preference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text("Usage: /set_preference <type> <value>\nExample: /set_preference gender female or /set_preference age 25")
+        await update.message.reply_text("Usage: /setpreference <type> <value>\nExample: /setpreference gender female or /setpreference age 25")
         return
     pref_type, pref_value = args[0].lower(), args[1].lower()
     if pref_type not in profile['preferences']:
@@ -313,7 +321,7 @@ async def set_preference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info(f"User {user_id} set preference {pref_type} to {pref_value}.")
     await update.message.reply_text(f"Preference '{pref_type}' has been set to '{pref_value}'.")
 
-async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS: return
     message_to_send = ' '.join(context.args)
     if not message_to_send:
@@ -332,13 +340,13 @@ async def maintenance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error(f"Failed to send maintenance broadcast to {user_id}: {e}")
     await update.message.reply_text(f"Maintenance broadcast finished.\n✅ Sent: {success_count}\n❌ Failed: {fail_count}")
 
-async def shutdown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS: return
     await update.message.reply_text("🛑 Shutting down the bot...")
     logger.info(f"Shutdown command received. Exiting.")
     asyncio.create_task(context.application.shutdown())
 
-async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS: return
     all_user_ids = database.get_all_user_ids()
     all_profiles = [database.get_user_profile(uid) for uid in all_user_ids]
@@ -353,7 +361,7 @@ async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     await update.message.reply_text(stats_text, parse_mode='MarkdownV2')
 
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS: return
     message_to_send = ' '.join(context.args)
     if not message_to_send:
@@ -372,17 +380,17 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             logger.error(f"Failed to send broadcast to {user_id}: {e}")
     await update.message.reply_text(f"Broadcast finished.\n✅ Sent: {success_count}\n❌ Failed: {fail_count}")
 
-async def trust_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def trustuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS: return
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /trust_user <user_id>")
+        await update.message.reply_text("Usage: /trustuser <user_id>")
         return
     user_id_to_trust = int(context.args[0])
     database.update_user_profile(user_id_to_trust, {'is_trusted': True})
     logger.info(f"Admin {update.effective_user.id} marked user {user_id_to_trust} as trusted.")
     await update.message.reply_text(f"User {user_id_to_trust} has been marked as a Trusted User.")
 
-async def ban_sticker_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def bansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bans a sticker by replying to it with this command."""
     if update.effective_user.id not in ADMIN_IDS: return
     if not update.message.reply_to_message or not update.message.reply_to_message.sticker:
@@ -391,6 +399,23 @@ async def ban_sticker_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     sticker_id = update.message.reply_to_message.sticker.file_unique_id
     database.add_banned_sticker(sticker_id)
     await update.message.reply_text("Sticker has been banned successfully.")
+
+async def listbannedstickers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lists all banned sticker unique IDs."""
+    if update.effective_user.id not in ADMIN_IDS: return
+
+    banned_ids = database.get_all_banned_stickers()
+    if not banned_ids:
+        await update.message.reply_text("There are no banned stickers.")
+        return
+
+    message = "📋 **Banned Sticker IDs**\n\n"
+    for sticker_id in banned_ids:
+        message += f"`{sticker_id}`\n"
+
+    # Send the message in chunks if it's too long
+    for i in range(0, len(message), 4096):
+        await update.message.reply_text(message[i:i+4096], parse_mode='MarkdownV2')
 
 def main() -> None:
     database.initialize_database()
@@ -405,15 +430,16 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("next", next_chat))
     application.add_handler(CommandHandler("myid", myid))
-    application.add_handler(CommandHandler("set_preference", set_preference))
+    application.add_handler(CommandHandler("setpreference", setpreference))
 
     # Admin Commands
-    application.add_handler(CommandHandler("maintenance", maintenance_cmd))
-    application.add_handler(CommandHandler("shutdown", shutdown_cmd))
-    application.add_handler(CommandHandler("dashboard", dashboard_cmd))
-    application.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    application.add_handler(CommandHandler("trust_user", trust_user_cmd))
-    application.add_handler(CommandHandler("ban_sticker", ban_sticker_cmd))
+    application.add_handler(CommandHandler("maintenance", maintenance))
+    application.add_handler(CommandHandler("shutdown", shutdown))
+    application.add_handler(CommandHandler("dashboard", dashboard))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("trustuser", trustuser))
+    application.add_handler(CommandHandler("bansticker", bansticker))
+    application.add_handler(CommandHandler("listbannedstickers", listbannedstickers))
 
     # Other Handlers
     application.add_handler(CallbackQueryHandler(handle_validation_callback, pattern=r'^validate_'))

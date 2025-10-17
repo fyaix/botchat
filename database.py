@@ -154,3 +154,16 @@ def is_sticker_banned(sticker_unique_id: str) -> bool:
     except sqlite3.Error as e:
         logger.error(f"Database error checking sticker {sticker_unique_id}: {e}")
         return False
+
+def get_all_banned_stickers() -> list[str]:
+    """Retrieves all banned sticker IDs from the database."""
+    try:
+        con = sqlite3.connect(DATABASE_FILE)
+        cur = con.cursor()
+        res = cur.execute("SELECT sticker_unique_id FROM banned_stickers")
+        sticker_ids = [row[0] for row in res.fetchall()]
+        con.close()
+        return sticker_ids
+    except sqlite3.Error as e:
+        logger.error(f"Database error getting all banned stickers: {e}")
+        return []

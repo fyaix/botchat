@@ -122,7 +122,7 @@ async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_
             if profile:
                 database.update_user_profile(user_id, {'reputation': profile['reputation'] + REP_CHANGE_REPORTED_ONCE})
                 database.increment_stat('total_reports')
-                keyboard = [[InlineKeyboardButton("✅ Yes", callback_data=f"validate_yes_{user_id}"), InlineKeyboardButton("❌ No", callback_data=f"validate_no_{user_id}")]]
+                keyboard = [[InlineKeyboardButton("Ya, Laporkan 🚫", callback_data=f"validate_yes_{user_id}"), InlineKeyboardButton("Tidak, Aman ✅", callback_data=f"validate_no_{user_id}")]]
                 await context.bot.send_message(chat_id=partner_id, text="⚠️ Your partner left right after sending a message. Was it a vulgar or promotional message?", reply_markup=InlineKeyboardMarkup(keyboard))
         elif chat_duration > 60:
             profile1 = database.get_user_profile(user_id)
@@ -183,7 +183,7 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.callback_query:
         await update.callback_query.edit_message_text(profile_text, parse_mode='MarkdownV2', reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text(profile_text, parse_mode='MarkdownV2', reply_markup=MAIN_REPLY_MARKUP)
+        await update.message.reply_text(profile_text, parse_mode='MarkdownV2')
     return AWAIT_MY_GENDER
 
 async def ask_for_input(update: Update, query_text: str, state: int) -> int:
@@ -243,12 +243,135 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     await start(update, context)
     return ConversationHandler.END
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def handle_validation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-def _check_reciprocal_match(user1_profile: dict, user2_profile: dict) -> bool: pass
-async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def _create_chat(user1_id: int, user2_id: int, context: ContextTypes.DEFAULT_TYPE): pass
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    partner_id = session.get_partner_id(user_id)
+    if not partner_id:
+        await update.message.reply_text("You are not in a chat. Use the buttons below or /start to find one.", reply_markup=MAIN_REPLY_MARKUP)
+        return
+    profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
+    if not profile: return # Defensive check
+    if profile['reputation'] <= REPUTATION_LEVEL_RISKY and update.message.sticker:
+        await update.message.reply_text("Your reputation is too low to send stickers.")
+        return
+    if profile['reputation'] <= REPUTATION_LEVEL_MONITORED:
+        tracker = session.get_behavior_tracker(user_id) or {}
+        if not tracker.get('delay_notified', False):
+            await update.message.reply_text("Your messages are being sent with a slight delay due to your low reputation score.", disable_notification=True)
+            tracker['delay_notified'] = True
+            session.set_behavior_tracker(user_id, tracker)
+        await asyncio.sleep(3)
+    message = update.message
+    if is_message_suspicious(message):
+        database.update_user_profile(user_id, {'reputation': profile['reputation'] + REP_CHANGE_SUSPICIOUS_MESSAGE})
+        database.log_event(user_id, "suspicious_message_detected", message.text or "Media with caption")
+        keyboard = [[InlineKeyboardButton("Ya, Laporkan 🚫", callback_data=f"report_yes_{user_id}"), InlineKeyboardButton("Tidak, Aman ✅", callback_data=f"report_no_{user_id}")]]
+        await context.bot.send_message(chat_id=partner_id,text="⚠️ **Pesan Mencurigakan Terdeteksi**\nApakah pesan terakhir dari partner Anda berisi promosi, spam, atau konten vulgar?", reply_markup=InlineKeyboardMarkup(keyboard))
+        await context.bot.send_message(chat_id=partner_id, text=f"_{escape_markdown('Pesan di atas ditandai sebagai berpotensi spam. Abaikan jika aman.', 2)}_", parse_mode='MarkdownV2')
+
+    tracker = session.get_behavior_tracker(user_id) or {}
+    tracker.update({'message_sent': True, 'last_message_time': time.time()})
+    session.set_behavior_tracker(user_id, tracker)
+    if message.text: await context.bot.send_message(chat_id=partner_id, text=message.text)
+    elif message.photo: await context.bot.send_photo(chat_id=partner_id, photo=message.photo[-1].file_id, caption=message.caption)
+    elif message.video: await context.bot.send_video(chat_id=partner_id, video=message.video.file_id, caption=message.caption)
+    elif message.sticker:
+        if database.is_sticker_banned(message.sticker.file_unique_id):
+            await update.message.reply_text("This sticker is not allowed.")
+            database.update_user_profile(user_id, {'reputation': profile['reputation'] + REP_CHANGE_SUSPICIOUS_MESSAGE})
+            return
+        await context.bot.send_sticker(chat_id=partner_id, sticker=message.sticker.file_id)
+    elif message.voice: await context.bot.send_voice(chat_id=partner_id, voice=message.voice.file_id)
+    elif message.document: await context.bot.send_document(chat_id=partner_id, document=message.document.file_id)
+    else: await update.message.reply_text("Unsupported message type.")
+
+async def handle_validation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    action, reported_user_id_str = query.data.split('_')[1], query.data.split('_')[2]
+    reported_user_id = int(reported_user_id_str)
+    profile = database.get_or_create_user_profile(reported_user_id, admin_ids=ADMIN_IDS)
+    if not profile: return
+    if action == "yes":
+        updates = {'reputation': profile['reputation'] + REP_CHANGE_CONFIRMED_SPAM, 'violation_count': profile['violation_count'] + 1}
+        if updates['violation_count'] >= MAX_VIOLATIONS_BEFORE_SHADOW_BAN:
+            updates['is_shadow_banned'] = True
+        database.update_user_profile(reported_user_id, updates)
+        await query.edit_message_text(text="Thank you. The user has been penalized.")
+    else:
+        reporter_profile = database.get_or_create_user_profile(query.from_user.id, admin_ids=ADMIN_IDS)
+        if reporter_profile:
+            database.update_user_profile(query.from_user.id, {'reputation': reporter_profile['reputation'] + REP_CHANGE_FALSE_REPORT})
+        await query.edit_message_text(text="Thank you for your feedback. No action was taken against the other user.")
+
+def _check_reciprocal_match(user1_profile: dict, user2_profile: dict) -> bool:
+    if not user1_profile or not user2_profile: return False
+    u1_prefs = user1_profile.get('preferences', {})
+    u2_prefs = user2_profile.get('preferences', {})
+    for key in ['gender', 'region']:
+        if u1_prefs.get(key) is not None and user2_profile.get(key) is not None and u1_prefs[key] != user2_profile[key]: return False
+        if u2_prefs.get(key) is not None and user1_profile.get(key) is not None and u2_prefs[key] != user1_profile[key]: return False
+    u1_age_pref, u2_age_pref = u1_prefs.get('age'), u2_prefs.get('age')
+    u1_age, u2_age = user1_profile.get('age'), user2_profile.get('age')
+    if u1_age_pref is not None and u2_age is not None and abs(u1_age_pref - u2_age) > 5: return False
+    if u2_age_pref is not None and u1_age is not None and abs(u2_age_pref - u1_age) > 5: return False
+    return True
+
+async def try_match_users(context: ContextTypes.DEFAULT_TYPE) -> None:
+    premium_q_str, regular_q_str = session.get_waiting_users()
+    p_q, r_q = deque(map(int, premium_q_str)), deque(map(int, regular_q_str))
+
+    unmatched_p_with_prefs, p_without_prefs = deque(), deque()
+    while p_q:
+        user_id = p_q.popleft()
+        profile = database.get_user_profile(user_id)
+        if not profile or profile.get('is_shadow_banned'): continue
+        if any(v is not None for v in profile.get('preferences', {}).values()):
+            unmatched_p_with_prefs.append(user_id)
+        else:
+            p_without_prefs.append(user_id)
+
+    still_unmatched_p = deque()
+    while unmatched_p_with_prefs:
+        user_id = unmatched_p_with_prefs.popleft()
+        user_profile = database.get_user_profile(user_id)
+        if not user_profile: continue
+        found_match = False
+        potential_partners = list(unmatched_p_with_prefs) + list(p_without_prefs) + list(r_q)
+        for partner_id in potential_partners:
+            partner_profile = database.get_user_profile(partner_id)
+            if not partner_profile: continue
+            if _check_reciprocal_match(user_profile, partner_profile):
+                await _create_chat(user_id, partner_id, context)
+                if partner_id in unmatched_p_with_prefs: unmatched_p_with_prefs.remove(partner_id)
+                elif partner_id in p_without_prefs: p_without_prefs.remove(partner_id)
+                elif partner_id in r_q: r_q.remove(partner_id)
+                found_match = True; break
+        if not found_match: still_unmatched_p.append(user_id)
+
+    p_q = still_unmatched_p + p_without_prefs
+    while len(p_q) >= 2: await _create_chat(p_q.popleft(), p_q.popleft(), context)
+    if len(p_q) == 1 and r_q: await _create_chat(p_q.popleft(), r_q.popleft(), context)
+    while len(r_q) >= 2: await _create_chat(r_q.popleft(), r_q.popleft(), context)
+
+async def _create_chat(user1_id: int, user2_id: int, context: ContextTypes.DEFAULT_TYPE):
+    session.start_chat_session(user1_id, user2_id)
+    profile1 = database.get_user_profile(user1_id)
+    profile2 = database.get_user_profile(user2_id)
+    if not profile1 or not profile2: return # Should not happen
+    session.remove_from_waiting_queue(user1_id, is_user_premium_active(profile1))
+    session.remove_from_waiting_queue(user2_id, is_user_premium_active(profile2))
+    session.set_behavior_tracker(user1_id, {'start_time': time.time(), 'message_sent': False, 'delay_notified': False})
+    session.set_behavior_tracker(user2_id, {'start_time': time.time(), 'message_sent': False, 'delay_notified': False})
+    database.increment_stat('successful_chats')
+    await context.bot.send_message(chat_id=user1_id, text="✨ Partner found! You can start chatting.", reply_markup=IN_CHAT_REPLY_MARKUP)
+    await context.bot.send_message(chat_id=user2_id, text="✨ Partner found! You can start chatting.", reply_markup=IN_CHAT_REPLY_MARKUP)
+
+async def report_partner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
+async def manual_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
+async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None: pass
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
 async def maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
 async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
@@ -260,16 +383,17 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
 async def generatecode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
 async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def report_partner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def manual_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None: pass
 
 def main() -> None:
-    # ... (the rest of main is the same)
-    pass
+    database.initialize_database()
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token: logger.error("TELEGRAM_BOT_TOKEN not set."); return
+    application = Application.builder().token(token).build()
+
+    # ... (handlers)
+
+    logger.info("Starting bot in polling mode...")
+    application.run_polling()
 
 if __name__ == "__main__":
     main()

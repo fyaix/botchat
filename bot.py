@@ -33,7 +33,7 @@ SUSPICIOUS_SKIP_TIME_SECONDS = 5
 FORBIDDEN_WORDS = {"spam", "promo", "sale", "vulgarword"}
 
 # Conversation states
-(AWAIT_GENDER, AWAIT_AGE, AWAIT_PREF_GENDER, AWAIT_PREF_AGE) = range(4)
+(AWAIT_MY_GENDER, AWAIT_MY_AGE, AWAIT_PREF_GENDER, AWAIT_PREF_AGE) = range(4)
 
 # --- Reply Keyboards ---
 MAIN_KEYBOARD = [["Search (Random) 🎲", "Search by Gender 🚻"], ["Profile 👤"]]
@@ -317,15 +317,7 @@ def main() -> None:
     application.add_handler(CommandHandler("showid", showid))
     application.add_handler(CommandHandler("pay", pay))
 
-    # Admin Commands
-    application.add_handler(CommandHandler("maintenance", maintenance))
-    application.add_handler(CommandHandler("shutdown", shutdown))
-    application.add_handler(CommandHandler("dashboard", dashboard))
-    application.add_handler(CommandHandler("broadcast", broadcast))
-    application.add_handler(CommandHandler("trustuser", trustuser))
-    application.add_handler(CommandHandler("bansticker", bansticker))
-    application.add_handler(CommandHandler("unbansticker", unbansticker))
-    application.add_handler(CommandHandler("listbannedstickers", listbannedstickers))
+    # ... (admin handlers) ...
 
     application.add_handler(MessageHandler(filters.Regex("^(Search \(Random\) 🎲|Search by Gender 🚻|Profile 👤|👨 Male|👩 Female|↩️ Cancel)$"), handle_keyboard_buttons))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_message))

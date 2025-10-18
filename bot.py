@@ -33,7 +33,7 @@ SUSPICIOUS_SKIP_TIME_SECONDS = 5
 FORBIDDEN_WORDS = {"spam", "promo", "sale", "vulgarword"}
 
 # Conversation states
-(AWAIT_MY_GENDER, AWAIT_MY_AGE, AWAIT_PREF_GENDER, AWAIT_PREF_AGE) = range(4)
+(AWAIT_GENDER, AWAIT_AGE, AWAIT_PREF_GENDER, AWAIT_PREF_AGE) = range(4)
 
 # --- Reply Keyboards ---
 MAIN_KEYBOARD = [["Search (Random) 🎲", "Search by Gender 🚻"], ["Profile 👤"]]
@@ -137,7 +137,7 @@ async def showid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_name = user_info.first_name or f"User {user_id}"
     profile_link = f"tg://user?id={user_id}"
     keyboard = [[InlineKeyboardButton(f"View {escape_markdown(user_name, 2)}'s Profile", url=profile_link)]]
-    await context.bot.send_message(chat_id=partner_id, text=f"Your partner, {escape_markdown(user_name, 2)}, wants to share their profile with you\.",
+    await context.bot.send_message(chat_id=partner_id, text=f"Your partner, {escape_markdown(user_name, 2)}, wants to share their profile with you\\.",
                                    reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='MarkdownV2')
     await update.message.reply_text("Your profile has been shared with your partner.")
 
@@ -163,7 +163,7 @@ async def profil(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.callback_query.edit_message_text(profile_text, parse_mode='MarkdownV2', reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await update.message.reply_text(profile_text, parse_mode='MarkdownV2', reply_markup=MAIN_REPLY_MARKUP)
-    return AWAIT_GENDER # A generic state for the conversation
+    return AWAIT_GENDER
 
 async def ask_for_input(update: Update, query_text: str, state: int) -> int:
     await update.callback_query.answer()
@@ -300,35 +300,32 @@ def main() -> None:
     profile_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("profil", profil), MessageHandler(filters.Regex("^Profile 👤$"), profil)],
         states={
-            AWAIT_MY_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_my_gender)],
-            AWAIT_MY_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_my_age)],
+            AWAIT_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_my_gender)],
+            AWAIT_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_my_age)],
             AWAIT_PREF_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_pref_gender)],
             AWAIT_PREF_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_pref_age)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation), MessageHandler(filters.Regex("^↩️ Cancel$"), cancel_conversation)],
-        map_to_parent={ ConversationHandler.END: -1 }
+        conversation_timeout=300
     )
 
-    main_conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            -1: [
-                CommandHandler("start", start),
-                CommandHandler("search", lambda u,c: start_search_flow(u,c)),
-                profile_conv_handler,
-                # ... other handlers
-            ]
-        },
-        fallbacks=[CommandHandler("start", start)]
-    )
-
+    application.add_handler(profile_conv_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("search", lambda u,c: start_search_flow(u,c)))
-    application.add_handler(CommandHandler("profil", profil))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("next", next_chat))
     application.add_handler(CommandHandler("showid", showid))
     application.add_handler(CommandHandler("pay", pay))
+
+    # Admin Commands
+    application.add_handler(CommandHandler("maintenance", maintenance))
+    application.add_handler(CommandHandler("shutdown", shutdown))
+    application.add_handler(CommandHandler("dashboard", dashboard))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("trustuser", trustuser))
+    application.add_handler(CommandHandler("bansticker", bansticker))
+    application.add_handler(CommandHandler("unbansticker", unbansticker))
+    application.add_handler(CommandHandler("listbannedstickers", listbannedstickers))
 
     application.add_handler(MessageHandler(filters.Regex("^(Search \(Random\) 🎲|Search by Gender 🚻|Profile 👤|👨 Male|👩 Female|↩️ Cancel)$"), handle_keyboard_buttons))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_message))

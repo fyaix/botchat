@@ -42,33 +42,61 @@ def is_message_suspicious(text: str) -> bool:
     return any(word in text_lower for word in FORBIDDEN_WORDS) or bool(re.search(r'@\w+', text))
 
 # --- Main Commands ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [InlineKeyboardButton("Search (Random)", callback_data="search_random")],
+        [InlineKeyboardButton("Search by Gender", callback_data="search_gender")]
+    ]
+    await update.message.reply_text("Please choose your search type:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def start_search_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, gender_filter: str | None = None):
     user_id = update.effective_user.id
     profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
+
+    # Use callback_query if available, otherwise use message
+    query = update.callback_query
+    message = query.message if query else update.message
+
     if profile['is_shadow_banned']:
-        await update.message.reply_text("🔎 Searching for a partner...")
+        await message.edit_text("🔎 Searching for a partner...") if query else await message.reply_text("🔎 Searching for a partner...")
         return
     if profile['reputation'] < REPUTATION_LEVEL_SUSPENDED:
-        await update.message.reply_text("Your reputation is too low to start a new chat.")
+        await message.edit_text("Your reputation is too low to start a new chat.") if query else await message.reply_text("Your reputation is too low...")
         return
     if session.get_partner_id(user_id):
-        await update.message.reply_text("You are already in a chat. Use /stop to end it.")
+        await message.edit_text("You are already in a chat. Use /stop to end it.") if query else await message.reply_text("You are already in a chat...")
         return
     waiting_premium, waiting_regular = session.get_waiting_users()
     if str(user_id) in waiting_premium or str(user_id) in waiting_regular:
-        await update.message.reply_text("You are already looking for a partner. Please wait.")
+        await message.edit_text("You are already looking for a partner. Please wait.") if query else await message.reply_text("You are already looking...")
         return
+
     session.set_behavior_tracker(user_id, {'start_time': time.time(), 'message_sent': False, 'delay_notified': False})
+
+    if gender_filter:
+        session.set_active_filter(user_id, gender_filter)
+        search_message = f"🔎 Searching for a {gender_filter} partner..."
+    else:
+        session.clear_active_filter(user_id)
+        search_message = "🔎 Searching for a random partner..."
+
     session.add_to_waiting_queue(user_id, is_premium=profile['is_premium'])
-    msg = "👑 Searching for a partner with high priority..." if profile['is_premium'] else "🔎 Searching for a partner..."
-    await update.message.reply_text(msg)
+
+    if query: await query.edit_message_text(search_message)
+    else: await message.reply_text(search_message)
+
     await try_match_users(context)
 
 async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_TYPE, is_next: bool = False):
     partner_id = session.end_chat_session(user_id)
     if not partner_id:
-        if not is_next: await context.bot.send_message(chat_id=user_id, text="You are not in a chat. Use /start to find one.")
+        if not is_next: await context.bot.send_message(chat_id=user_id, text="You are not in a chat. Use /search to find one.")
         return False
+
+    if not is_next: # Clear filter on /stop, but not on /next
+        session.clear_active_filter(user_id)
+        session.clear_active_filter(partner_id)
+
     tracker = session.get_behavior_tracker(user_id)
     if tracker:
         chat_duration = time.time() - tracker.get('start_time', 0)
@@ -82,6 +110,7 @@ async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_
         elif chat_duration > 60:
             database.update_user_profile(user_id, {'reputation': database.get_user_profile(user_id)['reputation'] + REP_CHANGE_NORMAL_CHAT})
             database.update_user_profile(partner_id, {'reputation': database.get_user_profile(partner_id)['reputation'] + REP_CHANGE_NORMAL_CHAT})
+
     if not is_next: await context.bot.send_message(chat_id=user_id, text="💬 You have left the chat.")
     await context.bot.send_message(chat_id=partner_id, text="💬 Your partner has left the chat.")
     session.remove_behavior_tracker(user_id); session.remove_behavior_tracker(partner_id)
@@ -89,7 +118,22 @@ async def handle_chat_disconnection(user_id: int, context: ContextTypes.DEFAULT_
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: await handle_chat_disconnection(update.effective_user.id, context)
 async def next_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await handle_chat_disconnection(update.effective_user.id, context, is_next=True): await start(update, context)
+    user_id = update.effective_user.id
+    active_filter = session.get_active_filter(user_id)
+
+    if await handle_chat_disconnection(user_id, context, is_next=True):
+        # Create a dummy update object to pass to start_search_flow
+        class DummyCallbackQuery:
+            def __init__(self, message): self.message = message
+        class DummyUpdate:
+            def __init__(self, message): self.callback_query = DummyCallbackQuery(message); self.effective_user = message.from_user
+
+        dummy_update = DummyUpdate(update.message)
+
+        if active_filter and 'gender' in active_filter:
+            await start_search_flow(dummy_update, context, gender_filter=active_filter['gender'])
+        else:
+            await start_search_flow(dummy_update, context)
 
 async def showid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -181,7 +225,6 @@ async def done_editing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Check if we are in a callback query context
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text("Editing cancelled.")
@@ -189,13 +232,12 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Editing cancelled.")
     return ConversationHandler.END
 
-
 # --- Message & Callback Handlers ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     partner_id = session.get_partner_id(user_id)
     if not partner_id:
-        await update.message.reply_text("You are not in a chat. Use /start to find one.")
+        await update.message.reply_text("You are not in a chat. Use /search to find one.")
         return
     profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
     if profile['reputation'] <= REPUTATION_LEVEL_RISKY and update.message.sticker:
@@ -245,9 +287,33 @@ async def handle_validation_callback(update: Update, context: ContextTypes.DEFAU
         database.update_user_profile(query.from_user.id, {'reputation': reporter_profile['reputation'] + REP_CHANGE_FALSE_REPORT})
         await query.edit_message_text(text="Thank you for your feedback. No action was taken against the other user.")
 
+async def search_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query; await query.answer()
+    user_id = query.from_user.id
+    profile = database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
+
+    if query.data == "search_random":
+        await start_search_flow(update, context)
+    elif query.data == "search_gender":
+        if not profile['is_premium']:
+            keyboard = [[InlineKeyboardButton("Buy Premium", callback_data="pay_premium")]]
+            await query.edit_message_text(
+                "Search by gender is a premium feature. Please upgrade to use it.\n\n"
+                "Premium Prices:\n- 1 Month: $5\n- 3 Months: $12\n- 1 Year: $40",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            keyboard = [[InlineKeyboardButton("Male", callback_data="search_gender_male"), InlineKeyboardButton("Female", callback_data="search_gender_female")]]
+            await query.edit_message_text("Please choose the gender you want to search for:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif query.data.startswith("search_gender_"):
+        gender = query.data.split('_')[-1]
+        await start_search_flow(update, context, gender_filter=gender)
+    elif query.data == "pay_premium":
+        await query.edit_message_text("Redirecting to payment... (not implemented)")
+        await context.bot.send_message(chat_id=user_id, text="Please use the /pay command for now.")
+
 # --- Matchmaking ---
 def _check_reciprocal_match(user1_profile: dict, user2_profile: dict) -> bool:
-    # Check gender and region
     for key in ['gender', 'region']:
         if user1_profile['preferences'].get(key) is not None and user1_profile.get(key) is not None and user1_profile['preferences'][key] != user2_profile[key]: return False
         if user2_profile['preferences'].get(key) is not None and user1_profile.get(key) is not None and user2_profile['preferences'][key] != user1_profile[key]: return False
@@ -306,16 +372,76 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                   f"Shadow Banned: {shadow_banned_count}")
     await update.message.reply_text(stats_text, parse_mode='MarkdownV2')
 
-# ... (other admin commands are the same) ...
-async def setpreference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def trustuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def bansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def unbansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
-async def listbannedstickers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: pass
+async def maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
+    message_to_send = ' '.join(context.args)
+    if not message_to_send: await update.message.reply_text("Usage: /maintenance <announcement>"); return
+    full_message = f"🔧 **Maintenance Announcement** 🔧\n\n{message_to_send}"
+    user_ids = database.get_all_user_ids()
+    await update.message.reply_text(f"📢 Starting maintenance broadcast to {len(user_ids)} users...")
+    success_count, fail_count = 0, 0
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=full_message, parse_mode='Markdown')
+            success_count += 1; await asyncio.sleep(0.1)
+        except Exception as e:
+            fail_count += 1; logger.error(f"Failed to send broadcast to {user_id}: {e}")
+    await update.message.reply_text(f"Broadcast finished.\n✅ Sent: {success_count}\n❌ Failed: {fail_count}")
 
+async def shutdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
+    await update.message.reply_text("🛑 Shutting down the bot...")
+    asyncio.create_task(context.application.shutdown())
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
+    message_to_send = ' '.join(context.args)
+    if not message_to_send: await update.message.reply_text("Usage: /broadcast <message>"); return
+    user_ids = database.get_all_user_ids()
+    await update.message.reply_text(f"📢 Starting broadcast to {len(user_ids)} users...")
+    success_count, fail_count = 0, 0
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=message_to_send)
+            success_count += 1; await asyncio.sleep(0.1)
+        except Exception as e:
+            fail_count += 1; logger.error(f"Failed to send broadcast to {user_id}: {e}")
+    await update.message.reply_text(f"Broadcast finished.\n✅ Sent: {success_count}\n❌ Failed: {fail_count}")
+
+async def trustuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not context.args or not context.args[0].isdigit(): await update.message.reply_text("Usage: /trustuser <user_id>"); return
+    user_id_to_trust = int(context.args[0])
+    database.update_user_profile(user_id_to_trust, {'is_trusted': True})
+    await update.message.reply_text(f"User {user_id_to_trust} has been marked as a Trusted User.")
+
+async def bansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not update.message.reply_to_message or not update.message.reply_to_message.sticker: await update.message.reply_text("Please reply to a sticker to ban it."); return
+    sticker = update.message.reply_to_message.sticker
+    database.add_banned_sticker(sticker.file_unique_id, sticker.file_id)
+    await update.message.reply_text("Sticker has been banned successfully.")
+
+async def unbansticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
+    if not update.message.reply_to_message or not update.message.reply_to_message.sticker: await update.message.reply_text("Please reply to a sticker to unban it."); return
+    sticker_id = update.message.reply_to_message.sticker.file_unique_id
+    database.remove_banned_sticker(sticker_id)
+    await update.message.reply_text("Sticker has been unbanned successfully.")
+
+async def listbannedstickers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS: return
+    banned_stickers = database.get_all_banned_stickers()
+    if not banned_stickers: await update.message.reply_text("There are no banned stickers."); return
+    await update.message.reply_text("📋 **Banned Stickers:**")
+    for sticker in banned_stickers:
+        try:
+            await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=sticker['sticker_file_id'])
+        except Exception as e:
+            await update.message.reply_text(f"Could not send sticker with unique_id: `{sticker['sticker_unique_id']}`\nError: {e}", parse_mode='MarkdownV2')
+
+async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Payment system is not yet implemented. Please contact an admin for premium status.")
 
 def main() -> None:
     database.initialize_database()
@@ -339,14 +465,15 @@ def main() -> None:
             AWAIT_PREF_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_pref_age)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
-        conversation_timeout=300 # 5 minutes
+        conversation_timeout=300
     )
 
     application.add_handler(profile_conv_handler)
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("search", search))
     application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("next", next_chat))
     application.add_handler(CommandHandler("showid", showid))
+    application.add_handler(CommandHandler("pay", pay))
 
     # Admin Commands
     application.add_handler(CommandHandler("maintenance", maintenance))
@@ -358,6 +485,8 @@ def main() -> None:
     application.add_handler(CommandHandler("unbansticker", unbansticker))
     application.add_handler(CommandHandler("listbannedstickers", listbannedstickers))
 
+    application.add_handler(CallbackQueryHandler(search_callback_handler, pattern="^search_"))
+    application.add_handler(CallbackQueryHandler(lambda u,c: pay(u.callback_query.message, c), pattern="^pay_premium$"))
     application.add_handler(CallbackQueryHandler(handle_validation_callback, pattern=r'^validate_'))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_message))
 

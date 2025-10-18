@@ -93,3 +93,33 @@ def get_behavior_tracker(user_id: int) -> dict | None:
 def remove_behavior_tracker(user_id: int):
     if not r: return
     r.hdel(BEHAVIOR_TRACKER_H, user_id)
+
+# --- Active Filter Management ---
+
+ACTIVE_FILTERS_H = "active_filters"
+
+def set_active_filter(user_id: int, gender: str):
+    """Sets the active gender filter for a user's session."""
+    if not r: return
+    r.hset(ACTIVE_FILTERS_H, user_id, f"gender:{gender}")
+    logger.info(f"Active filter for user {user_id} set to gender:{gender}")
+
+def get_active_filter(user_id: int) -> dict | None:
+    """Gets the active filter for a user."""
+    if not r: return None
+    filter_str = r.hget(ACTIVE_FILTERS_H, user_id)
+    if not filter_str:
+        return None
+
+    try:
+        filter_type, filter_value = filter_str.split(":", 1)
+        return {filter_type: filter_value}
+    except ValueError:
+        logger.error(f"Could not parse filter string for user {user_id}: {filter_str}")
+        return None
+
+def clear_active_filter(user_id: int):
+    """Clears the active filter for a user."""
+    if not r: return
+    r.hdel(ACTIVE_FILTERS_H, user_id)
+    logger.info(f"Active filter cleared for user {user_id}")

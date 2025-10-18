@@ -52,15 +52,15 @@ def is_message_suspicious(text: str) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     database.get_or_create_user_profile(user_id, admin_ids=ADMIN_IDS)
-    welcome_text = ("👋 **Welcome to the Anonymous Chat Bot!**\n\n"
-                    "You can start searching for a partner using the buttons below.\n\n"
-                    "**Available Commands:**\n"
-                    "`/start` - Shows this welcome message\n"
-                    "`/search` - Start a random search\n"
-                    "`/profil` - View and edit your profile\n"
-                    "`/stop` - Stop your current chat\n"
-                    "`/next` - Find a new chat partner\n"
-                    "`/showid` - Share your profile with your partner")
+    welcome_text = ("👋 *Welcome to the Anonymous Chat Bot\\!* \n\n"
+                    "You can start searching for a partner using the buttons below\\.\n\n"
+                    "*Available Commands:*\n"
+                    "`/start` \\- Shows this welcome message\n"
+                    "`/search` \\- Start a random search\n"
+                    "`/profil` \\- View and edit your profile\n"
+                    "`/stop` \\- Stop your current chat\n"
+                    "`/next` \\- Find a new chat partner\n"
+                    "`/showid` \\- Share your profile with your partner")
     await update.message.reply_text(welcome_text, reply_markup=MAIN_REPLY_MARKUP, parse_mode='MarkdownV2')
 
 async def start_search_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, gender_filter: str | None = None):

@@ -31,22 +31,28 @@ def get_all_banned_stickers() -> list[dict]: pass
 
 # --- Redeem Code Management ---
 def generate_redeem_codes(count: int, duration_days: int) -> list[str]:
-    codes = []
-    for _ in range(count):
-        code = str(uuid.uuid4())[:8].upper() # Short, uppercase, unique-enough code
-        codes.append(code)
-
+    generated_codes = []
+    con = None
     try:
         con = sqlite3.connect(DATABASE_FILE)
         cur = con.cursor()
-        cur.executemany("INSERT INTO redeem_codes (code, duration_days) VALUES (?, ?)",
-                        [(code, duration_days) for code in codes])
-        con.commit()
-        con.close()
-        return codes
+        while len(generated_codes) < count:
+            code = str(uuid.uuid4())[:8].upper()
+            try:
+                cur.execute("INSERT INTO redeem_codes (code, duration_days) VALUES (?, ?)", (code, duration_days))
+                con.commit()
+                generated_codes.append(code)
+            except sqlite3.IntegrityError:
+                logger.warning(f"Collision detected for redeem code {code}. Regenerating.")
+                con.rollback() # Rollback the failed insertion
+                continue # Try again with a new code
+        return generated_codes
     except sqlite3.Error as e:
         logger.error(f"DB error generating redeem codes: {e}", exc_info=True)
-        return []
+        return generated_codes # Return what has been generated so far
+    finally:
+        if con:
+            con.close()
 
 def get_redeem_code(code: str) -> dict | None:
     try:
